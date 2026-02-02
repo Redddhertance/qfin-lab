@@ -1,6 +1,6 @@
 import pandas as pd
 import yfinance as yf
-
+#potential futuree info: Annualized Return (AR) Sharpe Ratio Max Drawdown Alpha (vs. Benchmark) Information Ratio
 #define data source and extractors for  scanner function
 tickers = pd.read_csv('tests/scanner/scticker.csv')['ticker'].tolist()
 def analyse(tickers):
