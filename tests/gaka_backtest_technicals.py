@@ -162,15 +162,19 @@ def permutation_test_fixed(returns, weights_effective, n_trials=500000):
     real_pnl = (weights_effective * returns).sum(axis=1)
     real_equity = (1.0 + real_pnl).cumprod()
 
+    #(days * assets) * (assets * days) = (days * days), transpose (.t) returns to align dimensions for d product
+    print(f"Precomputing cross-PnL matrix for {len(returns)} days...")
+    cross_pnl_matrix = np.ascontiguousarray(
+        weights_effective.to_numpy(dtype=np.float64) @ returns.to_numpy(dtype=np.float64).T
+    )
     print(f"\nRunning {n_trials} permutation trials via C++ backend...")
     
     # Ensure data is contiguous in memory for C++ pointer math
-    weights_arr = np.ascontiguousarray(weights_effective.values, dtype=np.float64)
-    returns_arr = np.ascontiguousarray(returns.values, dtype=np.float64)
-
-    #exec c++ function
-    permutation_array = gaka_core.run_permutations_fast(weights_arr, returns_arr, n_trials)
-
+    #slow logic
+    #weights_arr = np.ascontiguousarray(weights_effective.values, dtype=np.float64)
+    #returns_arr = np.ascontiguousarray(returns.values, dtype=np.float64)
+    #fast logic
+    permutation_array = gaka_core.run_permutations_fast(cross_pnl_matrix, n_trials)
     
     fig, ax = plt.subplots(figsize=(14, 8))
     
