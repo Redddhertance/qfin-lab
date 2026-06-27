@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
+import gaka_core # type: ignore
 import os
 
 #pathing fix due to recent vscode updates, ensures csv files are found correctly regardless of where script is run from. not sure why this is suddenly occuring more often, implemented in both scanner and backtest scripts
@@ -19,7 +20,7 @@ END = '2026-01-01'
 raw = yf.download(TICKERS, start=START, end=END, auto_adjust=True) #type: ignore #get adjusted prices via autoadjust
 close = raw['Close'].copy() #get only closing prices #type: ignore
 close = close.ffill().bfill().fillna(0) #drop rows without prices
-returns = close.pct_change().fillna(0.0) #compute returns
+returns = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0) #compute returns, resolved infinity error caused by yfinance data (would break permutation graph when using C++ script)
 #pct_change = percentage change between daily returns ((today - yesterday) / yesterday)
 #fillna(0.0) fills vacant values with 0.0
 
@@ -78,8 +79,10 @@ for date in rebalance_dates:
     eligible_stocks = eligible.loc[date][eligible.loc[date] == True].index.tolist()
     #finds nearest day for rebalance, then puts eligible stocks on the day
     if len(eligible_stocks) > 0:
-        #eligible stocks = equal weight
-        weight = 1.0 / len(eligible_stocks)
+        #risk management, cap max alloc per asset at 5%
+        # if <20 stocks available, the remaining capital sits in cash (0% return)
+        MAX_WEIGHT = 0.05 
+        weight = min(1.0 / len(eligible_stocks), MAX_WEIGHT)
         
         next_rebalance_idx = eligible.index.get_loc(date)
         if next_rebalance_idx < len(eligible) - 1:
@@ -147,47 +150,36 @@ print(f'Outperformance: {annual_returnn - spy_annual:.2%}')
 print(f"Average positions held: {avg_positions:.1f}")
 print(f"Percent of days invested: {pct_time_in_market:.1%}")
 
-def permutation_test_fixed(returns, weights_effective, n_trials=200):
-    #permutation test: shuffle signal rows , not portfolio returns.
-    #shuffling portfolio returns is commutative under compounding — (1+r1)(1+r2)...(1+rT) is order-independent, so every permutation trial ends at the identical final value.
-    # Shuffling weight rows instead tests whether the TIMING of our signals has predictive power:
-    # each trial applies the real allocations to randomly chosen days.
+#permutation test: shuffle signal rows , not portfolio returns.
+#shuffling portfolio returns is commutative under compounding — (1+r1)(1+r2)...(1+rT) is order-independent, so every permutation trial ends at the identical final value.
+# Shuffling weight rows instead tests whether the TIMING of our signals has predictive power:
+# each trial applies the real allocations to randomly chosen days.
 
+# calculate real strategy portfolio returns and equity curve
+
+def permutation_test_fixed(returns, weights_effective, n_trials=500000):
     # calculate real strategy portfolio returns and equity curve
     real_pnl = (weights_effective * returns).sum(axis=1)
     real_equity = (1.0 + real_pnl).cumprod()
 
-    permutation_curves = []
-
-    print(f"Running {n_trials} permutation trials...")
-
-    weights_arr = weights_effective.values
-    returns_arr = returns.values
-
-    for trial in range(n_trials):
-        if trial % 20 == 0:
-            print(f"  Trial {trial}/{n_trials}")
-
-        #shuffles the signal/weight rows: each trial uses the same set of portfolio allocations but applied to randomly selected days
-        shuffled_weights = weights_arr[np.random.permutation(len(weights_arr))]
-
-        trial_pnl = (shuffled_weights * returns_arr).sum(axis=1)
-        trial_equity = (1.0 + pd.Series(trial_pnl, index=returns.index)).cumprod()
-
-        permutation_curves.append(trial_equity.values)
+    print(f"\nRunning {n_trials} permutation trials via C++ backend...")
     
-    #array conversion
-    permutation_array = np.array(permutation_curves)
+    # Ensure data is contiguous in memory for C++ pointer math
+    weights_arr = np.ascontiguousarray(weights_effective.values, dtype=np.float64)
+    returns_arr = np.ascontiguousarray(returns.values, dtype=np.float64)
+
+    #exec c++ function
+    permutation_array = gaka_core.run_permutations_fast(weights_arr, returns_arr, n_trials)
+
     
-    #plotting
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # grey 
-    for i in range(n_trials):
+    # first 200 to prevent matplotlib from crashing
+    plot_limit = min(n_trials, 200)
+    for i in range(plot_limit):
         ax.plot(real_equity.index, permutation_array[i], 
                 color='gray', alpha=0.3, linewidth=0.8)
     
-    # red
     ax.plot(real_equity.index, real_equity.values, 
             color='red', linewidth=2.5, label='Real Strategy', zorder=10)
     
@@ -203,27 +195,18 @@ def permutation_test_fixed(returns, weights_effective, n_trials=200):
     plt.savefig('permutation_test_corrected.png', dpi=300, bbox_inches='tight')
     plt.show()
     
-    #p-value calculation
+    #p-value calculation (C++ data)
     final_returns_random = permutation_array[:, -1]
     final_return_real = real_equity.iloc[-1]
     
     p_value = np.sum(final_returns_random >= final_return_real) / n_trials
     
-    print(f"\n=== Corrected Permutation Test Results ===")
+    print(f"\n=== Permutation Test Results ===")
     print(f"Real Strategy Final Value: ${final_return_real:.2f}")
     print(f"Random Mean: ${np.mean(final_returns_random):.2f}")
-    print(f"Random Median: ${np.median(final_returns_random):.2f}")
-    print(f"Random Std Dev: ${np.std(final_returns_random):.2f}")
-    print(f"P-value: {p_value:.4f}")
-    
-    if p_value < 0.05:
-        print("Statistically significant - strategy has edge")
-    elif p_value < 0.10:
-        print("Marginally significant - weak edge")
-    else:
-        print("Not significant - no proven edge")
+    print(f"P-value: {p_value:.6f}")
     
     return p_value, permutation_array, real_equity
 
 #run permutation test
-p_value, perm_curves, real_curve = permutation_test_fixed(returns, weights_effective, n_trials=200)
+p_value, perm_curves, real_curve = permutation_test_fixed(returns, weights_effective, n_trials=500000)
