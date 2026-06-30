@@ -207,8 +207,3 @@ marimo/_lsp/
 __marimo__/
 governance.txt
 .DS_Store
-qfin/risk.py
-qfin/metrics.py
-qfin/backest.py
-qfin/costs.py
-qfin/gaka_backtest_fundamentals.py

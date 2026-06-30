@@ -14,6 +14,39 @@ Risk Metrics Suite: Computes detailed portfolio risk profiles including annualiz
 
 High-Performance Statistical Edge Validation: Utilizes Monte Carlo-style permutation testing (Random Asset Selection / Monkey Dartboard) to decouple strategy signals from underlying asset returns. Driven by a custom C++ backend to scale up to 500,000 trials, definitively proving whether outperformance is statistically significant (p-value) or just luck.
 
+Project Structure
+The reusable logic lives in an installable qfin package, so the scanner and backtest share one definition of every indicator and risk metric rather than duplicating them:
+
+qfin/features.py — technical indicators (SMA, RSI, ATR, ATR%)
+
+qfin/risk.py — risk metrics (annualised volatility, Sharpe, max drawdown, VaR, CVaR, beta)
+
+qfin/backtest.py — the portfolio engine. Applies the one-day weight lag and turnover costs, returns the pnl series, equity curve and a metrics dict.
+
+qfin/permutation.py — cross-PnL matrix construction and a readable NumPy reference for the permutation test (the C++ gaka_core backend is the production path).
+
+qfin/data.py / qfin/utils.py — data loading, cleaning and small index helpers.
+
+src/gaka_core.cpp — the pybind11 permutation backend.
+
+Installation
+The C++ backend builds automatically through pip, no manual compiler invocation:
+
+    pip install -e .
+
+This compiles gaka_core in place via setup.py and makes the qfin package importable, which is what lets the scripts in tests/ run from any working directory.
+
+Testing & Continuous Integration
+The qfin package is covered by a pytest suite (tests/test_*.py) that runs on every push via GitHub Actions across Python 3.10–3.12. Notable tests:
+
+test_backtest.py asserts there is no lookahead bias — a strategy that is fully invested on a known spike day captures nothing, because weights are lagged; the test fails the instant the shift is removed.
+
+test_permutation.py checks the C++ backend and the NumPy reference sample the same permutation distribution, and that a no-edge strategy is correctly found insignificant.
+
+Run it with:
+
+    pytest -q
+
 Components
 Scanner (tests/scanner/scanner.py)
 Screens a CSV-defined ticker universe through a two-stage pipeline:

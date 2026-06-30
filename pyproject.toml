@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "pybind11>=2.10"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qfin-lab"
+version = "0.1.0"
+description = "Quantitative equity research framework: technical screening, risk analytics, backtesting and a C++ permutation engine."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scipy",
+    "statsmodels",
+    "yfinance",
+    "matplotlib",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pybind11>=2.10"]
+
+[tool.setuptools]
+packages = ["qfin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

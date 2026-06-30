@@ -1,7 +1,9 @@
 import pandas as pd
 import yfinance as yf
-import numpy as np
 import os
+
+from qfin.features import sma
+from qfin.risk import annualised_volatility, sharpe, max_drawdown, value_at_risk, conditional_var, beta as sector_beta_calc
 #potential future info: Annualized Return (AR) Alpha (vs. Benchmark)
 #ignored features: information ratio due to lack of usefulness, complex stress-tests due to unreliability and very very inconsistent and inapplicable market assumptions
 
@@ -34,7 +36,7 @@ def bulk_download(ticker_list):
             continue
         prices = df['Close']
         current_price = prices.iloc[-1]
-        sma200 = prices.rolling(window=200).mean().iloc[-1]
+        sma200 = sma(prices, window=200).iloc[-1]
         if current_price > sma200:
             survivors.append(ticker)
     print(f"Filter successful. Reducied  {len(ticker_list)} -> {len(survivors)} candidates.")
@@ -62,7 +64,7 @@ def screener(tickers): #fundamental/quant screener function which prints to scan
             if pe_ratio is None: pe_ratio = 0
 
             #technical data
-            sma200 = hist['Close'].rolling(window=200).mean().iloc[-1]
+            sma200 = sma(hist['Close'], window=200).iloc[-1]
             if sma200 is None or pd.isna(sma200): sma200 = 0
             current_price = hist['Close'].iloc[-1]
             if current_price is None: current_price = 0
@@ -102,23 +104,18 @@ def riskmetrics(tickers): #risk metrics function which prints to riskmetrics_res
                 print(f" No historical data found for {t}")
                 continue
             hist['Returns'] = hist['Close'].pct_change()
-            volatility = hist['Returns'].std() * np.sqrt(252)
-            total_return = (hist['Close'].iloc[-1] / hist['Close'].iloc[0]) - 1
+            volatility = annualised_volatility(hist['Returns'].dropna())
             risk_free = 0.04
-            sharpe_ratio = (total_return - risk_free) / volatility if volatility != 0 else 0
-            rolling_max = hist['Close'].cummax()
-            daily_drawdown = hist['Close'] / rolling_max - 1
-            max_dd = daily_drawdown.min()
-            var_95 = np.percentile(hist['Returns'].dropna(), 5)
-            cvar_95 = hist['Returns'][hist['Returns'] <= var_95].mean()
+            #using a risk-free-adjusted annualised sharpe from the shared risk module now, keeps the
+            #definition identical to the one the backtest reports
+            sharpe_ratio = sharpe(hist['Returns'].dropna(), risk_free=risk_free)
+            equity = (1.0 + hist['Returns'].fillna(0.0)).cumprod()
+            max_dd = max_drawdown(equity)
+            var_95 = value_at_risk(hist['Returns'], 0.05)
+            cvar_95 = conditional_var(hist['Returns'], 0.05)
             beta = stock_metadata.get('beta', 1) #using Communication Services sector ETF as benchmark for beta calculation, adjust different sectors
-            sector_comparison = pd.DataFrame({
-                'Stock' : hist['Returns'],
-                'Sector': sector_data['Close'].pct_change()
-            }).dropna()
             sector_shock = -0.10 #assumed 10% sector correction
-            matrix = np.cov(sector_comparison['Stock'], sector_comparison['Sector'])
-            sectorbeta = matrix[0, 1] / matrix[1, 1]
+            sectorbeta = sector_beta_calc(hist['Returns'], sector_data['Close'].pct_change())
             sector_risk = sectorbeta * sector_shock
             scenarios = {
                 'market_correction10': -0.10,
