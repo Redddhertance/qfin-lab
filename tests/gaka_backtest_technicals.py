@@ -4,11 +4,23 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import gaka_core # type: ignore
 import os
+import sys
 
 #pathing fix due to recent vscode updates, ensures csv files are found correctly regardless of where script is run from. not sure why this is suddenly occuring more often, implemented in both scanner and backtest scripts
 scriptdirectory = os.path.dirname(os.path.abspath(__file__))
 projectroot = os.path.dirname(scriptdirectory)
 csv_path = os.path.join(projectroot, 'data', 'lowcaptickers.csv')
+sys.path.insert(0, projectroot) #lets the shared qfin package import when this is run as a script rather than a module
+from qfin.tearsheet import build_tearsheet
+
+#cash rate the tearsheet sharpe is measured against. left at 0.0 so it matches the sharpe printed below,
+#set to 0.04 if you want sharpe in excess of cash which is fairer over 2022-2026 given where rates were
+RISK_FREE = 0.0
+#the C++ backend hands back a full (trials x days) curve matrix, so 500k trials over a 4 year sample
+#wants about 4gb of ram. drop it with GAKA_N_TRIALS=20000 for a quick run
+N_TRIALS = int(os.environ.get('GAKA_N_TRIALS', 500_000))
+MAX_WEIGHT = 0.05 #risk management, cap max alloc per asset at 5%
+REPORT_PATH = os.path.join(projectroot, 'reports', 'gaka_technicals_tearsheet.html')
 
 #universe
 #TICKERS = pd.read_csv('tests/scanner/scticker.csv')['ticker'].tolist()[:300] 
@@ -79,9 +91,7 @@ for date in rebalance_dates:
     eligible_stocks = eligible.loc[date][eligible.loc[date] == True].index.tolist()
     #finds nearest day for rebalance, then puts eligible stocks on the day
     if len(eligible_stocks) > 0:
-        #risk management, cap max alloc per asset at 5%
         # if <20 stocks available, the remaining capital sits in cash (0% return)
-        MAX_WEIGHT = 0.05 
         weight = min(1.0 / len(eligible_stocks), MAX_WEIGHT)
         
         next_rebalance_idx = eligible.index.get_loc(date)
@@ -210,7 +220,29 @@ def permutation_test_fixed(returns, weights_effective, n_trials=500000):
     print(f"Random Mean: ${np.mean(final_returns_random):.2f}")
     print(f"P-value: {p_value:.6f}")
     
-    return p_value, permutation_array, real_equity
+    return p_value, permutation_array, real_equity, final_returns_random, float(final_return_real)
 
 #run permutation test
-p_value, perm_curves, real_curve = permutation_test_fixed(returns, weights_effective, n_trials=500000)
+p_value, perm_curves, real_curve, perm_finals, real_final = permutation_test_fixed(
+    returns, weights_effective, n_trials=N_TRIALS
+)
+
+#tearsheet for the weekly IC, one self contained html file per run
+report = build_tearsheet(
+    pnl,
+    weights=weights_effective,
+    benchmark=spy_returns,
+    costs=costs,
+    title='GAKA Technicals - Low-Cap Momentum',
+    subtitle=(f'Above 200d SMA, RSI &gt; 55, ATR &lt; 5%, SPY regime filter, '
+              f'monthly rebalance, {MAX_WEIGHT:.0%} position cap'),
+    bench_label='SPY',
+    risk_free=RISK_FREE,
+    permutation={'final_values': perm_finals, 'real_final': real_final,
+                 'p_value': p_value},
+    notes=('Universe is a present-day IWM holdings snapshot, so results carry '
+           'survivorship bias. Costs are a flat 2bp per unit of turnover, which '
+           'is optimistic for micro-caps.'),
+    out_path=REPORT_PATH,
+)
+print(f'\nTearsheet written to {report}')
