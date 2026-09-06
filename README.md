@@ -1,6 +1,10 @@
 qfin-lab
 A quantitative equity research framework built for GAKA Labs, combining systematic technical screening with risk analytics and backtesting. Designed to support fundamental analysts by filtering a large stock universe down to actionable candidates.
 
+**notice:
+
+The repo had to be rebuilt due to a mistake on my end, when setting up a new IDE. This wiped the commit history and moved the codebase into a new repo. Please let me know if this creates any issues.**
+
 Overview
 The framework has two main components: a scanner that screens stocks on fundamental and technical criteria, and a backtesting engine that tests momentum-based strategies against historical data with rigorous validation.
 
