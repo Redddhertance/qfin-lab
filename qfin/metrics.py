@@ -3,7 +3,7 @@ import pandas as pd
 
 trading_days = 252
 
-def to_series(x):
+def to_series(x) -> pd.Series:
     #coerce whatever gets passed in into a float series, squeezing single column frames
     if isinstance(x, pd.Series):
         return x.astype(float)
@@ -138,7 +138,11 @@ def monthly_returns(pnl):
     if len(r) == 0 or not isinstance(r.index, pd.DatetimeIndex):
         return pd.DataFrame()
     monthly = r.resample('ME').apply(lambda x: float((1.0 + x).prod() - 1.0))
-    grid = pd.DataFrame({'year': monthly.index.year, 'month': monthly.index.month, 'ret': monthly.to_numpy()})
+    idx = pd.DatetimeIndex(monthly.index) #resample always gives a datetime index, this just tells the checker
+    #pulling .year/.month off each timestamp rather than the vectorised idx.year, which pandas
+    #builds dynamically so pylance can't see it. the index is one entry per month, so this is cheap
+    grid = pd.DataFrame({'year': [d.year for d in idx], 'month': [d.month for d in idx],
+                         'ret': np.asarray(monthly, dtype=float)})
     return grid.pivot(index='year', columns='month', values='ret').sort_index()
 
 def align(pnl, benchmark):
@@ -182,7 +186,7 @@ def capture_ratios(pnl, benchmark, period: str = 'ME'):
         return 0.0, 0.0
     if period and isinstance(joined.index, pd.DatetimeIndex):
         joined = joined.resample(period).agg(lambda x: float((1.0 + x).prod() - 1.0))
-    r, b = joined['r'].to_numpy(), joined['b'].to_numpy()
+    r, b = np.asarray(joined['r'], dtype=float), np.asarray(joined['b'], dtype=float)
 
     def capture(mask):
         if mask.sum() == 0:
