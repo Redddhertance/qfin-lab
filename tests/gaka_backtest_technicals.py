@@ -1,46 +1,63 @@
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import matplotlib.pyplot as plt
-import gaka_core # type: ignore
 import os
 import sys
+
+import gaka_core # type: ignore
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 #pathing fix due to recent vscode updates, ensures csv files are found correctly regardless of where script is run from. not sure why this is suddenly occuring more often, implemented in both scanner and backtest scripts
 scriptdirectory = os.path.dirname(os.path.abspath(__file__))
 projectroot = os.path.dirname(scriptdirectory)
-csv_path = os.path.join(projectroot, 'data', 'lowcaptickers.csv')
 sys.path.insert(0, projectroot) #lets the shared qfin package import when this is run as a script rather than a module
+
+from qfin import costs as C
+from qfin import data as D
+from qfin import metrics as M
+from qfin import universe as U
 from qfin.tearsheet import build_tearsheet
 
-#cash rate the tearsheet sharpe is measured against. left at 0.0 so it matches the sharpe printed below,
-#set to 0.04 if you want sharpe in excess of cash which is fairer over 2022-2026 given where rates were
-RISK_FREE = 0.0
-#the C++ backend hands back a full (trials x days) curve matrix, so 500k trials over a 4 year sample
-#wants about 4gb of ram. drop it with GAKA_N_TRIALS=20000 for a quick run
-N_TRIALS = int(os.environ.get('GAKA_N_TRIALS', 500_000))
-MAX_WEIGHT = 0.05 #risk management, cap max alloc per asset at 5%
-REPORT_PATH = os.path.join(projectroot, 'reports', 'gaka_technicals_tearsheet.html')
-
-#universe
-#TICKERS = pd.read_csv('tests/scanner/scticker.csv')['ticker'].tolist()[:300] 
-TICKERS = pd.read_csv(csv_path)['ticker'].tolist()[:1000]
-#testing with lowcap universe
 START = '2022-01-01'
 END = '2026-01-01'
-#data
-raw = yf.download(TICKERS, start=START, end=END, auto_adjust=True) #type: ignore #get adjusted prices via autoadjust
-close = raw['Close'].copy() #get only closing prices #type: ignore
-close = close.ffill().bfill().fillna(0) #drop rows without prices
-returns = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0) #compute returns, resolved infinity error caused by yfinance data (would break permutation graph when using C++ script)
-#pct_change = percentage change between daily returns ((today - yesterday) / yesterday)
-#fillna(0.0) fills vacant values with 0.0
+#cash rate the sharpe is measured against. 2022-2026 had rates around 4-5%, so reporting
+#raw return over vol rather than excess over cash was flattering the number by roughly 0.35
+RISK_FREE = 0.04
+#impact and the participation cap both scale with how big you are, so the backtest needs an
+#assumed book size. 10m is small enough that the cap never binds on s&p names, raise it to
+#see where capacity runs out
+CAPITAL = 1e7
+MAX_PARTICIPATION = 0.10 #never build a position needing more than 10% of a day's volume
+MAX_WEIGHT = 0.05 #risk management, cap max alloc per asset at 5%
+#the C++ backend hands back a full (trials x days) curve matrix, so 500k trials over a 4 year
+#sample wants about 4gb of ram. drop it with GAKA_N_TRIALS=20000 for a quick run
+N_TRIALS = int(os.environ.get('GAKA_N_TRIALS', 500_000))
+REPORT_PATH = os.path.join(projectroot, 'reports', 'gaka_technicals_tearsheet.html')
+PRICE_CACHE = os.path.join(projectroot, 'data', 'cache', 'sp500_prices.pkl')
 
-spy_data = yf.download('SPY', start=START, end=END, auto_adjust=True) #type: ignore
-spy = spy_data['Close'] #type: ignore
+#point in time universe. taking the index as it stood on each past date puts back the names
+#that have since been acquired or dropped, which a current holdings file silently omits
+membership = U.build_membership(START, END)
+tickers = U.all_tickers(membership)
+raw = D.download(tickers, START, END, cache_path=PRICE_CACHE)
+
+#no bfill anywhere. a name is untradeable outside its real listed window rather than being
+#given an invented flat price history that a 200 day trend filter would happily accept
+prices = D.clean_prices(raw)
+close, valid = prices['close'], prices['valid']
+high, low, volume = prices['high'], prices['low'], prices['volume']
+returns = D.to_returns(close, valid)
+adv = D.dollar_volume(close, volume)
+spread = C.liquidity_spread(adv)
+daily_vol = returns.rolling(21, min_periods=5).std()
+in_index = U.membership_mask(membership, close.index, close.columns)
+
+priced = int(valid.any().sum())
+print(f'Universe: {len(tickers)} names ever in the index, {priced} priceable, '
+      f'{len(tickers) - priced} unavailable on yfinance')
+
+spy_data = yf.download('SPY', start=START, end=END, auto_adjust=True, progress=False) #type: ignore
 spy_close = pd.Series(spy_data['Close'].squeeze()) #type: ignore
-spy_returns = spy.pct_change().fillna(0.0)
-spy_equity = (1.0 + spy_returns).cumprod()
+spy_returns = spy_close.pct_change().fillna(0.0)
 
 def atr(high, low, close, window=14):
     high_low = high - low
@@ -48,184 +65,106 @@ def atr(high, low, close, window=14):
     low_close = np.abs(low - close.shift())
     tr = np.maximum(high_low, high_close)
     tr = np.maximum(tr, low_close) #true range, max of the three ranges for each stock
-    atr = tr.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
-    #uses wilders smoothing method (exponential moving average with alpha = 1/window) to calculate ATR, which gives more weight to recent values, more reliable than SMA approximation
-    return atr
+    #uses wilders smoothing method (exponential moving average with alpha = 1/window), which gives more weight to recent values, more reliable than SMA approximation
+    return tr.ewm(alpha=1/window, min_periods=window, adjust=False).mean()
 
 def calculate_sma(prices, window=200):
-    #price > 200 sma
     return prices.rolling(window=window, min_periods=window).mean()
-def calcuate_rsi(close, window=14):
-    period = 14
+
+def calculate_rsi(close, period=14):
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
-sma200 = calculate_sma(close)
-validsma = close > sma200
-rsi = calcuate_rsi(close)
-validrsi = rsi > 55
+validsma = close > calculate_sma(close)
+validrsi = calculate_rsi(close) > 55
+validatr = (atr(high, low, close) / close) < 0.05
+spy_sma200 = spy_close.rolling(window=200, min_periods=200).mean()
+market_regime = pd.DataFrame(
+    np.tile((spy_close > spy_sma200).to_numpy().reshape(-1, 1), (1, close.shape[1])),
+    index=close.index, columns=close.columns)
 
-atr_values = atr(raw['High'], raw['Low'], raw['Close']) #type: ignore
-atrpercent = atr_values / close
-validatr = atrpercent < 0.05
+#a name has to pass the signal, be priceable that day, and actually be in the index that day
+eligible = validsma & validrsi & validatr & market_regime & valid & in_index
 rebalance_dates = pd.date_range(start=START, end=END, freq='ME')
 
-weights_today = pd.DataFrame(0.0, index=returns.index, columns=returns.columns) #type: ignore
-spy_sma200 = spy_close.rolling(window=200, min_periods=200).mean()
-market_regime = (spy_close > spy_sma200) #series
-market_regime_df = pd.DataFrame(
-    np.tile(market_regime.to_numpy().reshape(-1, 1), (1, close.shape[1])),
-    index=close.index,
-    columns=close.columns
-)
-eligible = validsma & validrsi & validatr & market_regime_df
-for date in rebalance_dates:
-    if date not in eligible.index:
-        date = eligible.index[eligible.index.get_indexer([date], method='nearest')[0]]
-    eligible_stocks = eligible.loc[date][eligible.loc[date] == True].index.tolist()
-    #finds nearest day for rebalance, then puts eligible stocks on the day
-    if len(eligible_stocks) > 0:
-        # if <20 stocks available, the remaining capital sits in cash (0% return)
-        weight = min(1.0 / len(eligible_stocks), MAX_WEIGHT)
-        
-        next_rebalance_idx = eligible.index.get_loc(date)
-        if next_rebalance_idx < len(eligible) - 1:
-            future_rebalances = [d for d in rebalance_dates if d > date]
-            if future_rebalances:
-                next_date = future_rebalances[0]
-                if next_date not in eligible.index:
-                    next_date = eligible.index[eligible.index.get_indexer([next_date], method='nearest')[0]]
-                next_idx = eligible.index.get_loc(next_date)
-            else:
-                next_idx = len(eligible)
-            
-            #weight-setting
-            weights_today.loc[eligible.index[next_rebalance_idx]:eligible.index[min(next_idx-1, len(eligible)-1)], eligible_stocks] = weight
+weights_today = pd.DataFrame(0.0, index=returns.index, columns=returns.columns)
+snap_dates = [eligible.index[eligible.index.get_indexer([d], method='nearest')[0]] for d in rebalance_dates]
+for i, date in enumerate(snap_dates):
+    eligible_stocks = eligible.loc[date][eligible.loc[date]].index.tolist()
+    if not eligible_stocks:
+        continue #nothing passes, the book sits in cash until the next rebalance
+    weight = min(1.0 / len(eligible_stocks), MAX_WEIGHT)
+    end_date = snap_dates[i + 1] if i + 1 < len(snap_dates) else eligible.index[-1]
+    start_i, end_i = eligible.index.get_loc(date), eligible.index.get_loc(end_date)
+    weights_today.iloc[start_i:max(end_i, start_i + 1),
+                       weights_today.columns.get_indexer(eligible_stocks)] = weight
 
-#######n = returns.shape[1]
-#shape provides df dimensions, shape[1] is for column count
-#n = number of assets (SPY + QQQ, 2), allocates equal weights (n=2) every day each gets 0.5, creates df full of 0.5 with same shape as returns
-########weights_today = pd.DataFrame(1.0 / n, index=returns.index, columns=returns.columns)#establishes equal weights
-#create df of weights that have same shape as returns and gives each asset a weight of 50%
-#weights rebalanced daily
+#hold through the month, but drop anything that stops being tradeable (delisting, halt)
+weights_today = weights_today.where(valid, 0.0)
+#refuses to hold more than the book could actually fill at the participation limit
+weights_today = C.participation_cap(weights_today, adv, capital=CAPITAL,
+                                    max_participation=MAX_PARTICIPATION)
+
 weights_effective = weights_today.shift(1).fillna(0.0) #lag weights by one day to avoid lookahead bias (weights determined on t for t+1)
-#fillna(0.0) fills first day with 0 as it will be null after shift(1)
-#means that weights determined today will only be used tomorrow
-gross_p_return = (weights_effective * returns).sum(axis=1) #portfolio return (gross)
-#weight * return daily, then sums across columns for total daily return)
-bps_per_turnover = 2.0 #2 bp per 100% turnover, for buying/selling the whole portfolio, 0.02% is lsot in cost
-daily_turnover = weights_effective.diff().abs().sum(axis=1).fillna(0.0) #daily turnover, .diff calculates difference w previous day, abs value (direction irrelevant), sums across columns (sum(axis-1)), fills na w 0.0
-costs = daily_turnover * (bps_per_turnover / 1e4) #transaction costs
-#divide by 1e4 to convert bps into decimal form (0.0002), multiply by daily_turnover to get daily transaction costs
-#If yesterday weights = [0.5, 0.5], today = [0.4, 0.6], turnover = |0.4–0.5| + |0.6–0.5| = 0.2 (20% of portfolio traded).
-pnl = gross_p_return - costs #net pnl after costs
-equity = (1.0 + pnl).cumprod()
-#adds 1 to each return then multiplies them all together (cumprod). This gives cumulative portfolio value assuming it starts with $1
-#data
-trading_days = 252
-annual_returnn = equity.iloc[-1] ** (trading_days / len(pnl)) - 1.0
-#iloc[-1] gets last value of series, final portfolio value. (increases to 252/number of days to annualise growth (total growth into annual growth))
-annual_volatility = pnl.std(ddof=0) * np.sqrt(trading_days)
-#ddof=0 provides population standard deviation rather than small sample bias
-#stnadard deviation of daily returns, scales by sqrt252 to annualise volatility
-sharpe = (pnl.mean() * trading_days) / annual_volatility
-max_dd = (equity / equity.cummax() - 1.0).min()
-#dd = how much portfolio fell from previous high. equity cummax keeps track of maximum throughout year to maintain highest (cummax)
-#dividing equity by cummax and subtracting 1 provides percentage drop
-#min() takes lowest drop as max drawdown
+gross_p_return = (weights_effective * returns).sum(axis=1)
+#spread on every trade plus square root impact that grows with participation, replacing the
+#flat 2bp which was an institutional large cap number doing far too much work
+costs, spread_cost, impact_cost = C.total_costs(weights_effective, spread, adv, daily_vol,
+                                                capital=CAPITAL)
+pnl = gross_p_return - costs
 
-spy_final_value = float(spy_equity.iloc[-1])
-spy_annual = spy_final_value ** (trading_days / len(spy_returns)) - 1.0
-#ensures value rather than series
-avg_positions = (weights_effective > 0).sum(axis=1).mean()
-pct_time_in_market = (weights_effective.sum(axis=1) > 0).mean()
+summary = M.summarise(pnl, weights=weights_effective, benchmark=spy_returns, costs=costs,
+                      risk_free=RISK_FREE)
+bench = M.summarise(spy_returns, risk_free=RISK_FREE)
 
+print('\n=== GAKA Strategy Performance ===')
+print(f"Days: {summary['n_days']}")
+print(f"Annual Return: {summary['annual_return']:.2%}")
+print(f"Annual Volatility: {summary['annual_vol']:.2%}")
+print(f"Sharpe (excess of {RISK_FREE:.1%}): {summary['sharpe']:.2f}")
+print(f"Max Drawdown: {summary['max_dd']:.2%}")
+print(f"Annualised turnover: {summary['annual_turnover']:.1f}x")
+print(f"Cost drag: {summary['cost_drag']:.2%} "
+      f"(spread {spread_cost.mean() * 252:.2%}, impact {impact_cost.mean() * 252:.2%})")
+print(f"\n=== Benchmark (SPY) ===")
+print(f"Annual Return: {bench['annual_return']:.2%}")
+print(f"Sharpe (excess of {RISK_FREE:.1%}): {bench['sharpe']:.2f}")
+print(f"Max Drawdown: {bench['max_dd']:.2%}")
+print(f"\n=== Alpha ===")
+print(f"Outperformance: {summary['excess_return']:.2%}")
+print(f"Average positions held: {summary['avg_positions']:.1f}")
+print(f"Percent of days invested: {summary['pct_time_invested']:.1%}")
 
-print('=== GAKA Strategy Performance ===')
-print(f'Days: {len(pnl)}')
-print(f'Annual Return: {annual_returnn:.2%}')
-print(f'Annual Volatility: {annual_volatility:.2%}')
-print(f'Sharpe: {sharpe:.2f}')
-print(f'Max Drawdown: {max_dd:.2%}')
-print(f'\n=== Benchmark (SPY) ===')
-print(f'Annual Return: {spy_annual:.2%}')
-print(f'\n=== Alpha ===')
-print(f'Outperformance: {annual_returnn - spy_annual:.2%}')
-print(f"Average positions held: {avg_positions:.1f}")
-print(f"Percent of days invested: {pct_time_in_market:.1%}")
-
-#permutation test: shuffle signal rows , not portfolio returns.
+#permutation test: shuffle signal rows, not portfolio returns.
 #shuffling portfolio returns is commutative under compounding — (1+r1)(1+r2)...(1+rT) is order-independent, so every permutation trial ends at the identical final value.
-# Shuffling weight rows instead tests whether the TIMING of our signals has predictive power:
-# each trial applies the real allocations to randomly chosen days.
-
-# calculate real strategy portfolio returns and equity curve
-
-def permutation_test_fixed(returns, weights_effective, n_trials=500000):
-    # calculate real strategy portfolio returns and equity curve
+#shuffling weight rows instead tests whether the TIMING of our signals has predictive power:
+#each trial applies the real allocations to randomly chosen days.
+def permutation_test_fixed(returns, weights_effective, n_trials=N_TRIALS):
     real_pnl = (weights_effective * returns).sum(axis=1)
     real_equity = (1.0 + real_pnl).cumprod()
 
-    #(days * assets) * (assets * days) = (days * days), transpose (.t) returns to align dimensions for d product
-    print(f"Precomputing cross-PnL matrix for {len(returns)} days...")
+    #(days * assets) * (assets * days) = (days * days), transpose to align dimensions
+    print(f'\nPrecomputing cross-PnL matrix for {len(returns)} days...')
     cross_pnl_matrix = np.ascontiguousarray(
-        weights_effective.to_numpy(dtype=np.float64) @ returns.to_numpy(dtype=np.float64).T
-    )
-    print(f"\nRunning {n_trials} permutation trials via C++ backend...")
-    
-    # Ensure data is contiguous in memory for C++ pointer math
-    #slow logic
-    #weights_arr = np.ascontiguousarray(weights_effective.values, dtype=np.float64)
-    #returns_arr = np.ascontiguousarray(returns.values, dtype=np.float64)
-    #fast logic
+        weights_effective.to_numpy(dtype=np.float64) @ returns.to_numpy(dtype=np.float64).T)
+    print(f'Running {n_trials} permutation trials via C++ backend...')
     permutation_array = gaka_core.run_permutations_fast(cross_pnl_matrix, n_trials)
-    
-    fig, ax = plt.subplots(figsize=(14, 8))
-    
-    # first 200 to prevent matplotlib from crashing
-    plot_limit = min(n_trials, 200)
-    for i in range(plot_limit):
-        ax.plot(real_equity.index, permutation_array[i], 
-                color='gray', alpha=0.3, linewidth=0.8)
-    
-    ax.plot(real_equity.index, real_equity.values, 
-            color='red', linewidth=2.5, label='Real Strategy', zorder=10)
-    
-    ax.set_xlabel('Date', fontsize=12)
-    ax.set_ylabel('Cumulative Return (Log Scale)', fontsize=12)
-    ax.set_yscale('log')
-    ax.set_title(f'Permutation Test (Corrected): Real Strategy vs {n_trials} Random Trials', 
-                 fontsize=14, color='green')
-    ax.legend(fontsize=12)
-    ax.grid(alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('permutation_test_corrected.png', dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    #p-value calculation (C++ data)
-    final_returns_random = permutation_array[:, -1]
-    final_return_real = real_equity.iloc[-1]
-    
-    p_value = np.sum(final_returns_random >= final_return_real) / n_trials
-    
-    print(f"\n=== Permutation Test Results ===")
-    print(f"Real Strategy Final Value: ${final_return_real:.2f}")
-    print(f"Random Mean: ${np.mean(final_returns_random):.2f}")
-    print(f"P-value: {p_value:.6f}")
-    
-    return p_value, permutation_array, real_equity, final_returns_random, float(final_return_real)
 
-#run permutation test
-p_value, perm_curves, real_curve, perm_finals, real_final = permutation_test_fixed(
-    returns, weights_effective, n_trials=N_TRIALS
-)
+    final_returns_random = permutation_array[:, -1]
+    final_return_real = float(real_equity.iloc[-1])
+    p_value = float(np.sum(final_returns_random >= final_return_real) / n_trials)
+
+    print(f'\n=== Permutation Test Results ===')
+    print(f'Real Strategy Final Value: ${final_return_real:.2f}')
+    print(f'Random Mean: ${np.mean(final_returns_random):.2f}')
+    print(f'P-value: {p_value:.6f}')
+    return p_value, final_returns_random, final_return_real
+
+p_value, perm_finals, real_final = permutation_test_fixed(returns, weights_effective)
 
 #tearsheet for the weekly IC, one self contained html file per run
 report = build_tearsheet(
@@ -233,16 +172,16 @@ report = build_tearsheet(
     weights=weights_effective,
     benchmark=spy_returns,
     costs=costs,
-    title='GAKA Technicals - Low-Cap Momentum',
-    subtitle=(f'Above 200d SMA, RSI &gt; 55, ATR &lt; 5%, SPY regime filter, '
-              f'monthly rebalance, {MAX_WEIGHT:.0%} position cap'),
+    title='GAKA Technicals - S&P 500 Momentum',
+    subtitle=(f'Point-in-time S&P 500, above 200d SMA, RSI &gt; 55, ATR &lt; 5%, SPY regime '
+              f'filter, monthly rebalance, {MAX_WEIGHT:.0%} position cap'),
     bench_label='SPY',
     risk_free=RISK_FREE,
-    permutation={'final_values': perm_finals, 'real_final': real_final,
-                 'p_value': p_value},
-    notes=('Universe is a present-day IWM holdings snapshot, so results carry '
-           'survivorship bias. Costs are a flat 2bp per unit of turnover, which '
-           'is optimistic for micro-caps.'),
-    out_path=REPORT_PATH,
-)
+    permutation={'final_values': perm_finals, 'real_final': real_final, 'p_value': p_value},
+    notes=(f'Universe rebuilt point-in-time from index membership, so names that left the '
+           f'index are included while they were members. {len(tickers) - priced} of '
+           f'{len(tickers)} members could not be priced on yfinance, mostly acquisitions and '
+           f'renames, so a residual survivorship gap remains. Costs are a liquidity-scaled '
+           f'spread plus square-root impact on an assumed ${CAPITAL/1e6:.0f}m book.'),
+    out_path=REPORT_PATH)
 print(f'\nTearsheet written to {report}')
